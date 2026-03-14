@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Linq;
@@ -9,6 +9,8 @@ using System.Reflection.Emit;
 using System.Threading;
 
 using Dapper;
+using Dapper.Contrib.Extensions;
+using System.Globalization;
 
 namespace Dapper.Contrib.Extensions
 {
@@ -52,16 +54,16 @@ namespace Dapper.Contrib.Extensions
         /// <param name="type">The <see cref="Type"/> to get a table name for.</param>
         public delegate string TableNameMapperDelegate(Type type);
 
-        private static readonly ConcurrentDictionary<RuntimeTypeHandle, IEnumerable<PropertyInfo>> KeyProperties = new ConcurrentDictionary<RuntimeTypeHandle, IEnumerable<PropertyInfo>>();
-        private static readonly ConcurrentDictionary<RuntimeTypeHandle, IEnumerable<PropertyInfo>> ExplicitKeyProperties = new ConcurrentDictionary<RuntimeTypeHandle, IEnumerable<PropertyInfo>>();
-        private static readonly ConcurrentDictionary<RuntimeTypeHandle, IEnumerable<PropertyInfo>> TypeProperties = new ConcurrentDictionary<RuntimeTypeHandle, IEnumerable<PropertyInfo>>();
-        private static readonly ConcurrentDictionary<RuntimeTypeHandle, IEnumerable<PropertyInfo>> ComputedProperties = new ConcurrentDictionary<RuntimeTypeHandle, IEnumerable<PropertyInfo>>();
-        private static readonly ConcurrentDictionary<RuntimeTypeHandle, string> GetQueries = new ConcurrentDictionary<RuntimeTypeHandle, string>();
-        private static readonly ConcurrentDictionary<RuntimeTypeHandle, string> TypeTableName = new ConcurrentDictionary<RuntimeTypeHandle, string>();
+        private static readonly ConcurrentDictionary<RuntimeTypeHandle, IEnumerable<WritablePropertyInfo>> KeyProperties = new();
+        private static readonly ConcurrentDictionary<RuntimeTypeHandle, IEnumerable<WritablePropertyInfo>> ExplicitKeyProperties = new();
+        private static readonly ConcurrentDictionary<RuntimeTypeHandle, IEnumerable<WritablePropertyInfo>> TypeProperties = new();
+        private static readonly ConcurrentDictionary<RuntimeTypeHandle, IEnumerable<WritablePropertyInfo>> ComputedProperties = new();
+        private static readonly ConcurrentDictionary<RuntimeTypeHandle, string> GetQueries = new();
+        private static readonly ConcurrentDictionary<RuntimeTypeHandle, string> TypeTableName = new();
 
         private static readonly ISqlAdapter DefaultAdapter = new SqlServerAdapter();
         private static readonly Dictionary<string, ISqlAdapter> AdapterDictionary
-            = new Dictionary<string, ISqlAdapter>(6)
+            = new(6)
             {
                 ["sqlconnection"] = new SqlServerAdapter(),
                 ["sqlceconnection"] = new SqlCeServerAdapter(),
@@ -71,9 +73,9 @@ namespace Dapper.Contrib.Extensions
                 ["fbconnection"] = new FbAdapter()
             };
 
-        private static List<PropertyInfo> ComputedPropertiesCache(Type type)
+        private static List<WritablePropertyInfo> ComputedPropertiesCache(Type type)
         {
-            if (ComputedProperties.TryGetValue(type.TypeHandle, out IEnumerable<PropertyInfo> pi))
+            if (ComputedProperties.TryGetValue(type.TypeHandle, out var pi))
             {
                 return pi.ToList();
             }
@@ -84,61 +86,108 @@ namespace Dapper.Contrib.Extensions
             return computedProperties;
         }
 
-        private static List<PropertyInfo> ExplicitKeyPropertiesCache(Type type)
+        private static List<WritablePropertyInfo> ExplicitKeyPropertiesCache(Type type)
         {
-            if (ExplicitKeyProperties.TryGetValue(type.TypeHandle, out IEnumerable<PropertyInfo> pi))
+            if (ExplicitKeyProperties.TryGetValue(type.TypeHandle, out var pi))
             {
                 return pi.ToList();
             }
 
-            var explicitKeyProperties = TypePropertiesCache(type).Where(p => p.GetCustomAttributes(true).Any(a => a is ExplicitKeyAttribute)).ToList();
+            var explicitKeyProperties = TypePropertiesCache(type).Where(p => p.GetCustomAttributes(true).Any(a => a is KeyAttribute ka && !ka.AutoIncrement)).ToList();
 
             ExplicitKeyProperties[type.TypeHandle] = explicitKeyProperties;
             return explicitKeyProperties;
         }
 
-        private static List<PropertyInfo> KeyPropertiesCache(Type type)
+        private static List<WritablePropertyInfo> KeyPropertiesCache(Type type)
         {
-            if (KeyProperties.TryGetValue(type.TypeHandle, out IEnumerable<PropertyInfo> pi))
+            if (KeyProperties.TryGetValue(type.TypeHandle, out var pi))
             {
                 return pi.ToList();
             }
 
             var allProperties = TypePropertiesCache(type);
-            var keyProperties = allProperties.Where(p => p.GetCustomAttributes(true).Any(a => a is KeyAttribute)).ToList();
+            var keyProperties = allProperties.Where(p => p.GetCustomAttributes(true).Any(a => a is KeyAttribute ka && ka.AutoIncrement)).ToList();
+            //var keyProperties = allProperties.Where(p => p.GetCustomAttributes(true).Any(a => a is KeyAttribute)).ToList();
 
             if (keyProperties.Count == 0)
             {
                 var idProp = allProperties.Find(p => string.Equals(p.Name, "id", StringComparison.CurrentCultureIgnoreCase));
-                if (idProp != null && !idProp.GetCustomAttributes(true).Any(a => a is ExplicitKeyAttribute))
-                {
-                    keyProperties.Add(idProp);
-                }
             }
 
             KeyProperties[type.TypeHandle] = keyProperties;
             return keyProperties;
         }
 
-        private static List<PropertyInfo> TypePropertiesCache(Type type)
+        private static List<WritablePropertyInfo> TypePropertiesCache(Type type)
         {
-            if (TypeProperties.TryGetValue(type.TypeHandle, out IEnumerable<PropertyInfo> pis))
+            if (TypeProperties.TryGetValue(type.TypeHandle, out IEnumerable<WritablePropertyInfo> pis))
             {
                 return pis.ToList();
             }
 
-            var properties = type.GetProperties().Where(IsWriteable).ToArray();
+            var properties = type.GetProperties().Where(IsWriteable).Select(p => new WritablePropertyInfo(p)).ToArray();
             TypeProperties[type.TypeHandle] = properties;
             return properties.ToList();
         }
 
         private static bool IsWriteable(PropertyInfo pi)
+        => GetWriteable(pi).writable;
+
+        private static (bool writable, WriteMode mode) GetWriteable(PropertyInfo pi)
         {
             var attributes = pi.GetCustomAttributes(typeof(WriteAttribute), false).AsList();
-            if (attributes.Count != 1) return true;
+            if (attributes.Count != 1) return (true, WriteMode.Both);
 
             var writeAttribute = (WriteAttribute)attributes[0];
-            return writeAttribute.Write;
+            return (writeAttribute.Write, writeAttribute.Mode);
+        }
+
+
+        private class WritablePropertyInfo : PropertyInfo
+        {
+            private readonly PropertyInfo _prop;
+            public bool Writable { get; private set; }
+            public WriteMode Mode { get; private set; }
+
+            public WritablePropertyInfo(PropertyInfo prop)
+            {
+                _prop = prop;
+                var (wr, md) = GetWriteable(prop);
+                Writable = wr;
+                Mode = md;
+            }
+
+            public WritablePropertyInfo(PropertyInfo prop, bool writable, WriteMode mode)
+            {
+                _prop = prop;
+                Writable = writable;
+                Mode = mode;
+            }
+
+            public override PropertyAttributes Attributes => _prop.Attributes;
+
+            public override bool CanRead => _prop.CanRead;
+
+            public override bool CanWrite => _prop.CanWrite;
+
+            public override Type PropertyType => _prop.PropertyType;
+
+            public override Type DeclaringType => _prop.DeclaringType;
+
+            public override string Name => _prop.Name;
+
+            public override Type ReflectedType => _prop.ReflectedType;
+
+            public override MethodInfo[] GetAccessors(bool nonPublic) => _prop.GetAccessors(nonPublic);
+            public override object[] GetCustomAttributes(bool inherit) => _prop.GetCustomAttributes(inherit);
+            public override object[] GetCustomAttributes(Type attributeType, bool inherit) => _prop.GetCustomAttributes(attributeType, inherit);
+            public override MethodInfo GetGetMethod(bool nonPublic) => _prop.GetGetMethod(nonPublic);
+            public override ParameterInfo[] GetIndexParameters() => _prop.GetIndexParameters();
+            public override MethodInfo GetSetMethod(bool nonPublic) => _prop.GetSetMethod(nonPublic);
+            public override object GetValue(object obj, BindingFlags invokeAttr, Binder binder, object[] index, CultureInfo culture) => _prop.GetValue(obj, invokeAttr, binder, index, culture);
+            public override bool IsDefined(Type attributeType, bool inherit) => _prop.IsDefined(attributeType, inherit);
+            public override void SetValue(object obj, object value, BindingFlags invokeAttr, Binder binder, object[] index, CultureInfo culture) => _prop.SetValue(obj, value, invokeAttr, binder, index, culture);
         }
 
         private static PropertyInfo GetSingleKey<T>(string method)
@@ -347,7 +396,11 @@ namespace Dapper.Contrib.Extensions
             var allProperties = TypePropertiesCache(type);
             var keyProperties = KeyPropertiesCache(type);
             var computedProperties = ComputedPropertiesCache(type);
-            var allPropertiesExceptKeyAndComputed = allProperties.Except(keyProperties.Union(computedProperties)).ToList();
+            var allPropertiesExceptKeyAndComputed = allProperties
+                .Except(keyProperties.Union(computedProperties))
+                .Where(p => (p.Mode & WriteMode.Insert) == WriteMode.Insert)
+                .ToList();
+
 
             var adapter = GetFormatter(connection);
 
@@ -435,7 +488,10 @@ namespace Dapper.Contrib.Extensions
             var allProperties = TypePropertiesCache(type);
             keyProperties.AddRange(explicitKeyProperties);
             var computedProperties = ComputedPropertiesCache(type);
-            var nonIdProps = allProperties.Except(keyProperties.Union(computedProperties)).ToList();
+            var nonIdProps = allProperties
+                .Except(keyProperties.Union(computedProperties))
+                .Where(p => (p.Mode & WriteMode.Update) == WriteMode.Update)
+                .ToList();
 
             var adapter = GetFormatter(connection);
 
@@ -454,6 +510,7 @@ namespace Dapper.Contrib.Extensions
                 if (i < keyProperties.Count - 1)
                     sb.Append(" and ");
             }
+            Console.WriteLine(sb.ToString());
             var updated = connection.Execute(sb.ToString(), entityToUpdate, commandTimeout: commandTimeout, transaction: transaction);
             return updated > 0;
         }
@@ -587,7 +644,7 @@ namespace Dapper.Contrib.Extensions
                 // Generate a field for each property, which implements the T
                 foreach (var property in typeof(T).GetProperties())
                 {
-                    var isId = property.GetCustomAttributes(true).Any(a => a is KeyAttribute);
+                    var isId = property.GetCustomAttributes(true).Any(a => a is KeyAttribute ka && ka.AutoIncrement);
                     CreateProperty<T>(typeBuilder, property.Name, property.PropertyType, setIsDirtyMethod, isId);
                 }
 
@@ -685,8 +742,8 @@ namespace Dapper.Contrib.Extensions
                 if (isIdentity)
                 {
                     var keyAttribute = typeof(KeyAttribute);
-                    var myConstructorInfo = keyAttribute.GetConstructor(Type.EmptyTypes);
-                    var attributeBuilder = new CustomAttributeBuilder(myConstructorInfo, Array.Empty<object>());
+                    var myConstructorInfo = keyAttribute.GetConstructor(new Type[] { typeof(bool) });
+                    var attributeBuilder = new CustomAttributeBuilder(myConstructorInfo, new object[] { true });
                     property.SetCustomAttribute(attributeBuilder);
                 }
 
@@ -727,14 +784,34 @@ namespace Dapper.Contrib.Extensions
     [AttributeUsage(AttributeTargets.Property)]
     public class KeyAttribute : Attribute
     {
+        /// <summary>
+        /// Specifies that this key field is auto increment, that default value is true.
+        /// </summary>
+        public bool AutoIncrement { get; private set; }
+
+        /// <summary>
+        /// Create a new instance.
+        /// </summary>
+        /// <param name="autoIncrement">Specifies that this key field is auto increment.</param>
+        public KeyAttribute(bool autoIncrement) : base() => AutoIncrement = autoIncrement;
+        /// <summary>
+        /// Specifies that this key field is auto increment.
+        /// </summary>
+        [Obsolete("Please use KeyAttribute(true).")]
+        public KeyAttribute():this(true) {}
     }
 
     /// <summary>
     /// Specifies that this field is an explicitly set primary key in the database
     /// </summary>
+    [Obsolete("KeyAttribute and ExplicitKeyAttribute have been merged; please use KeyAttribute(false).")]
     [AttributeUsage(AttributeTargets.Property)]
-    public class ExplicitKeyAttribute : Attribute
+    public class ExplicitKeyAttribute : KeyAttribute
     {
+        /// <summary>
+        /// Create a new instance.
+        /// </summary>
+        public ExplicitKeyAttribute() : base(false) { }
     }
 
     /// <summary>
@@ -747,15 +824,34 @@ namespace Dapper.Contrib.Extensions
         /// Specifies whether a field is writable in the database.
         /// </summary>
         /// <param name="write">Whether a field is writable in the database.</param>
-        public WriteAttribute(bool write)
+        public WriteAttribute(bool write) : this(write, WriteMode.Both) { }
+
+        /// <summary>
+        /// Specifies whether a field is writable in the database.
+        /// </summary>
+        /// <param name="write">Whether a field is writable in the database.</param>
+        /// <param name="mode">Whether a field is insertable or updatable.</param>
+        public WriteAttribute(bool write, WriteMode mode)
         {
             Write = write;
+            Mode = mode;
         }
+
+        /// <summary>
+        /// Specifies whether a field is writable in the database.
+        /// </summary>
+        /// <param name="mode">Whether a field is insertable or updatable.</param>
+        public WriteAttribute(WriteMode mode) : this(true, mode) { }
+
 
         /// <summary>
         /// Whether a field is writable in the database.
         /// </summary>
         public bool Write { get; }
+        /// <summary>
+        /// Whether a field is insertable or updatable.
+        /// </summary>
+        public WriteMode Mode { get; }
     }
 
     /// <summary>
@@ -764,6 +860,25 @@ namespace Dapper.Contrib.Extensions
     [AttributeUsage(AttributeTargets.Property)]
     public class ComputedAttribute : Attribute
     {
+    }
+
+    /// <summary>
+    /// Specifies whether a field is writable in the database.
+    /// </summary>
+    public enum WriteMode : int
+    {
+        /// <summary>
+        /// The Field can INSERT.
+        /// </summary>
+        Insert = 1,
+        /// <summary>
+        /// The Field can Update.
+        /// </summary>
+        Update = 2,
+        /// <summary>
+        /// The Field can Insert and Update.
+        /// </summary>
+        Both = 3,
     }
 }
 
@@ -1064,6 +1179,7 @@ public partial class SQLiteAdapter : ISqlAdapter
     public int Insert(IDbConnection connection, IDbTransaction transaction, int? commandTimeout, string tableName, string columnList, string parameterList, IEnumerable<PropertyInfo> keyProperties, object entityToInsert)
     {
         var cmd = $"INSERT INTO {tableName} ({columnList}) VALUES ({parameterList}); SELECT last_insert_rowid() id";
+        Console.WriteLine(cmd);
         var multi = connection.QueryMultiple(cmd, entityToInsert, transaction, commandTimeout);
 
         var id = (int)multi.Read().First().id;
@@ -1152,4 +1268,5 @@ public partial class FbAdapter : ISqlAdapter
     {
         sb.AppendFormat("{0} = @{1}", columnName, columnName);
     }
+
 }
